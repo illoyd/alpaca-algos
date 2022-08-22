@@ -7,8 +7,8 @@ import numpy as np
 import pandas as pd
 import pytz
 
-ABORT_IF_CLOSED = True
-IMBALANCE_THRESHOLD = 1.3
+ABORT_IF_CLOSED = False
+IMBALANCE_THRESHOLD = 1.8
 
 
 class Quote:
@@ -41,12 +41,12 @@ class Quote:
 
 
 class Order:
-    def __init__(self, _id: str, _symbol: str, _side: str, _quantity: int):
+    def __init__(self, _id: str, _symbol: str, _side: str, _quantity: float):
         self.id = _id
         self.symbol = _symbol.upper()
         self.side = _side.lower()
         self.quantity = _quantity
-        self.filled_quantity = 0
+        self.filled_quantity: float = 0.0
 
     @staticmethod
     def from_data(data):
@@ -54,7 +54,7 @@ class Order:
             data.order['id'],
             data.order['symbol'],
             data.order['side'],
-            data.order['qty']
+            float(data.order['qty'])
         )
 
     def __repr__(self):
@@ -97,6 +97,9 @@ class Strategy:
     def start(self):
         pass
 
+    def stop(self):
+        pass
+
     def on_quote(self, quote: Quote):
         pass
 
@@ -116,9 +119,10 @@ class Runner:
         self.connection = None
         self.api: Union[trade_api.REST, None] = None
 
-    def add_strategy(self, strategy: Strategy):
-        self.strategies.append(strategy)
-        strategy.runner = self
+    def add_strategy(self, *strategies: Strategy):
+        for strategy in strategies:
+            strategy.runner = self
+            self.strategies.append(strategy)
 
     def start(self):
         # Prepare the API
@@ -128,8 +132,14 @@ class Runner:
         # Check if the market is open
         clock = self.api.get_clock()
         if ABORT_IF_CLOSED and clock.is_open is False:
-            print(f'Markets are closed (now {clock.timestamp.strftime("%a %-d %b %H:%M:%S")}); aborting')
+            print(
+                f'Markets are closed (now {clock.timestamp.strftime("%a %-d %b %H:%M:%S")}). Next open is {clock.next_open.strftime("%a %-d %b %H:%M:%S")}')
             return
+
+        # Track when will close
+        tz_ny = pytz.timezone('America/New_York')
+        liquidate_at = clock.next_close - pd.Timedelta(minutes=5)
+        print(f'Will liquidate positions at {liquidate_at.strftime("%a %-d %b %H:%M:%S")}.')
 
         # Prepare all strategies
         for strategy in self.strategies:
@@ -140,6 +150,11 @@ class Runner:
             # print(f'Received quote {quote}')
             for strategy in self.strategies:
                 strategy.on_quote(quote)
+            # If closing...
+            if datetime.now(tz=tz_ny) >= liquidate_at:
+                self.connection.stop()
+                for strategy in self.strategies:
+                    strategy.stop()
 
         async def on_trade(data):
             print(f'Received trade {data.symbol} {data.size} @ {data.price}')
@@ -191,16 +206,29 @@ class TickTakerStrategy(Strategy):
             else:
                 raise
 
+    def stop(self):
+        # Liquidate position immediately
+        self.api.close_position(self.symbol)
+
     def total_position(self):
+        # print([order.directional_quantity for order in self.orders.values()])
         return self.position + sum([order.directional_quantity for order in self.orders.values()])
 
     @property
     def can_buy(self):
-        return (self.total_position() + self.quantity_per_trade) < self.max_quantity
+        return self.total_position() < self.max_quantity
+
+    @property
+    def buyable_quantity(self):
+        return min(self.quantity_per_trade, self.max_quantity - self.total_position())
 
     @property
     def can_sell(self):
-        return self.total_position() - self.quantity_per_trade >= 0
+        return self.total_position() > 0
+
+    @property
+    def sellable_quantity(self):
+        return min(self.quantity_per_trade, self.total_position())
 
     def on_quote(self, quote: Quote):
         if (
@@ -217,7 +245,7 @@ class TickTakerStrategy(Strategy):
         # Ignore this trade if...
         # It is for a different symbol
         if data.symbol != self.symbol:
-            print('Ignoring trade - not the right symbol')
+            # print('Ignoring trade - not the right symbol')
             return
 
         # We already traded on this level
@@ -245,9 +273,10 @@ class TickTakerStrategy(Strategy):
                 and self.can_buy
         ):
             try:
+                quote.traded = True
                 self.api.submit_order(
                     symbol=self.symbol,
-                    qty=str(self.quantity_per_trade),
+                    qty=str(self.buyable_quantity),
                     side='buy',
                     type='limit',
                     time_in_force='ioc',
@@ -255,7 +284,6 @@ class TickTakerStrategy(Strategy):
                 )
 
                 print('Buy at', quote.ask, flush=True)
-                quote.traded = True
 
             except Exception as e:
                 print(e)
@@ -273,16 +301,16 @@ class TickTakerStrategy(Strategy):
         ):
             # Everything looks right, so we submit our sell at the bid
             try:
+                quote.traded = True
                 self.api.submit_order(
                     symbol=self.symbol,
-                    qty=str(self.quantity_per_trade),
+                    qty=str(self.sellable_quantity),
                     side='sell',
                     type='limit',
                     time_in_force='ioc',
                     limit_price=str(quote.bid)
                 )
                 print('Sell at', quote.bid, flush=True)
-                quote.traded = True
             except Exception as e:
                 print(e)
         else:
@@ -323,7 +351,7 @@ if __name__ == '__main__':
         help='Symbol you want to trade.'
     )
     parser.add_argument(
-        '--quantity', type=int, default=1000,
+        '--quantity', type=int, default=500,
         help='Maximum number of shares to hold at once. Minimum 100.'
     )
     parser.add_argument(
@@ -342,6 +370,7 @@ if __name__ == '__main__':
     assert args.quantity >= 100
     runner = Runner()
     runner.add_strategy(
-        TickTakerStrategy(args.symbol, args.quantity, 100)
+        TickTakerStrategy(args.symbol, args.quantity, 100),
+        TickTakerStrategy('UVXY', args.quantity, 100)
     )
     runner.start()
