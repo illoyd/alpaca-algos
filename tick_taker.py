@@ -1,4 +1,5 @@
 import argparse
+import logging
 from datetime import datetime
 from typing import List, Union, MutableMapping
 
@@ -9,6 +10,8 @@ import pytz
 
 ABORT_IF_CLOSED = False
 IMBALANCE_THRESHOLD = 1.8
+
+TZ_NY = pytz.timezone('America/New_York')
 
 
 class Quote:
@@ -126,20 +129,19 @@ class Runner:
 
     def start(self):
         # Prepare the API
-        print("Creating API...")
+        logging.info("Creating API...")
         self.api = trade_api.REST()
 
         # Check if the market is open
         clock = self.api.get_clock()
         if ABORT_IF_CLOSED and clock.is_open is False:
-            print(
+            logging.warning(
                 f'Markets are closed (now {clock.timestamp.strftime("%a %-d %b %H:%M:%S")}). Next open is {clock.next_open.strftime("%a %-d %b %H:%M:%S")}')
             return
 
         # Track when will close
-        tz_ny = pytz.timezone('America/New_York')
         liquidate_at = clock.next_close - pd.Timedelta(minutes=5)
-        print(f'Will liquidate positions at {liquidate_at.strftime("%a %-d %b %H:%M:%S")}.')
+        logging.info(f'Will liquidate positions at {liquidate_at.strftime("%a %-d %b %H:%M:%S")}.')
 
         # Prepare all strategies
         for strategy in self.strategies:
@@ -147,22 +149,22 @@ class Runner:
 
         async def on_quote(data):
             quote = Quote.from_data(data)
-            # print(f'Received quote {quote}')
+            logging.debug(f'Received quote {quote}')
             for strategy in self.strategies:
                 strategy.on_quote(quote)
             # If closing...
-            if datetime.now(tz=tz_ny) >= liquidate_at:
+            if datetime.now(tz=TZ_NY) >= liquidate_at:
                 self.connection.stop()
                 for strategy in self.strategies:
                     strategy.stop()
 
         async def on_trade(data):
-            print(f'Received trade {data.symbol} {data.size} @ {data.price}')
+            logging.debug(f'Received trade {data.symbol} {data.size} @ {data.price}')
             for strategy in self.strategies:
                 strategy.on_trade(data)
 
         async def on_trade_updates(data):
-            # print(f'Received order {data}')
+            logging.debug(f'Received order {data}')
             # Fetch or create the order based on the Order ID, then pass to strategy
             order_id = data.order['id']
             if order_id not in self.orders:
@@ -172,7 +174,7 @@ class Runner:
 
         # Configure connection
         symbols = [strategy.symbol for strategy in self.strategies]
-        print("Starting connection for", *symbols)
+        logging.info(f"Starting connection for {', '.join(symbols)}")
         self.connection = trade_api.Stream()
         self.connection.subscribe_quotes(on_quote, *symbols)
         self.connection.subscribe_trades(on_trade, *symbols)
@@ -183,11 +185,10 @@ class Runner:
 class TickTakerStrategy(Strategy):
     def __init__(self, _symbol: str, max_quantity: int = 500, quantity_per_trade: int = 100):
         super().__init__(_symbol)
-        tz_ny = pytz.timezone('America/New_York')
         self.max_quantity = max_quantity
         self.quantity_per_trade = quantity_per_trade
-        self.current_quote = Quote(self.symbol, 0, 0, 0, 0, datetime.now(tz=tz_ny))
-        self.previous_quote = Quote(self.symbol, 0, 0, 0, 0, datetime.now(tz=tz_ny))
+        self.current_quote = Quote(self.symbol, 0, 0, 0, 0, datetime.now(tz=TZ_NY))
+        self.previous_quote = Quote(self.symbol, 0, 0, 0, 0, datetime.now(tz=TZ_NY))
         self.position = 0
         self.level_changes = 0
 
@@ -196,11 +197,11 @@ class TickTakerStrategy(Strategy):
         # Get current position
         try:
             data = self.api.get_position(self.symbol)
-            print(data)
+            logging.debug(data)
             self.position = float(data.qty)
-            print(f'Found {self.position} positions for {self.symbol}')
+            logging.info(f'Found {self.position} positions for {self.symbol}')
         except trade_api.rest.APIError as ex:
-            print(f'No positions for {self.symbol} found (code: {ex.code} / {ex})')
+            logging.warning(f'No positions for {self.symbol} found (code: {ex.code} / {ex})')
             if ex.code == 40410000:
                 self.position = 0
             else:
@@ -211,7 +212,7 @@ class TickTakerStrategy(Strategy):
         self.api.close_position(self.symbol)
 
     def total_position(self):
-        # print([order.directional_quantity for order in self.orders.values()])
+        logging.debug([order.directional_quantity for order in self.orders.values()])
         return self.position + sum([order.directional_quantity for order in self.orders.values()])
 
     @property
@@ -239,32 +240,35 @@ class TickTakerStrategy(Strategy):
             self.previous_quote = self.current_quote
             self.current_quote = quote
             self.level_changes += 1
-            print('Level change:', self.previous_quote, self.current_quote, flush=True)
+            logging.debug(f'Level change: {self.previous_quote}, {self.current_quote}')
 
     def on_trade(self, data):
         # Ignore this trade if...
         # It is for a different symbol
         if data.symbol != self.symbol:
-            # print('Ignoring trade - not the right symbol')
+            # logging.debug('Ignoring trade - not the right symbol')
             return
+
+        # Log trade
+        logging.info(f'Received trade {data.symbol} {data.size} @ {data.price}')
+        logging.info(f'Latest quote {self.current_quote}')
 
         # We already traded on this level
         if self.current_quote.has_traded:
-            print('Ignoring trade - already traded at this level')
+            logging.info('Ignoring trade - already traded at this level')
             return
 
         # OR the trade is too close to the quote update so may be stale (for the old quote)
         if data.timestamp <= self.current_quote.timestamp + pd.Timedelta(np.timedelta64(50, 'ms')):
-            print('Ignoring trade - too recent')
+            logging.info('Ignoring trade - too recent')
             return
 
         # OR the trade size was too small
         if data.size < 100:
-            print('Ignoring trade - too small')
+            logging.info('Ignoring trade - too small')
             return
 
         quote = self.current_quote
-        print(f'Current quote: {quote}')
 
         # Place a BUY order if...
         if (
@@ -283,14 +287,14 @@ class TickTakerStrategy(Strategy):
                     limit_price=str(quote.ask)
                 )
 
-                print('Buy at', quote.ask, flush=True)
+                logging.info(f'Buy at {quote.ask}')
 
             except Exception as e:
-                print(e)
+                logging.exception(e)
         else:
             ask = data.price == quote.ask
             imbalance = quote.bid_size > quote.ask_size * IMBALANCE_THRESHOLD
-            print(
+            logging.debug(
                 f'Ask? {ask}; Imbalance? {imbalance}; Can buy? {self.can_buy}')
 
         # Place a SELL order if...
@@ -310,13 +314,13 @@ class TickTakerStrategy(Strategy):
                     time_in_force='ioc',
                     limit_price=str(quote.bid)
                 )
-                print('Sell at', quote.bid, flush=True)
+                logging.info(f'Sell at {quote.bid}')
             except Exception as e:
-                print(e)
+                logging.exception(e)
         else:
             bid = data.price == quote.bid
             imbalance = quote.ask_size > quote.bid_size * IMBALANCE_THRESHOLD
-            print(
+            logging.debug(
                 f'Bid? {bid}; Imbalance? {imbalance}; Can sell? {self.can_sell}')
 
     def on_trade_updates(self, event, order: Order, data):
@@ -335,16 +339,19 @@ class TickTakerStrategy(Strategy):
             self.on_order_cancelled(event, order)
 
     def on_order_settled(self, order: Order):
-        print(f'Order settled {order}')
+        logging.info(f'Order settled {order}')
         self.position += order.directional_quantity
         del self.runner.orders[order.id]
 
     def on_order_cancelled(self, event, order: Order):
-        print(f'Order {event} {order}')
+        logging.info(f'Order {event} {order}')
         del self.runner.orders[order.id]
 
 
 if __name__ == '__main__':
+    logging_file = f'alpaca-algos-{datetime.now(tz=TZ_NY).strftime("%Y-%m-%d")}.log'
+    logging.basicConfig(filename=logging_file, level=logging.INFO)
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--symbol', type=str, default='SNAP',
